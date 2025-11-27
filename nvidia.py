@@ -6,124 +6,91 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, timedelta
 
-# ---------------------------------------------------------
-# 1. データ取得 & 前処理
-# ---------------------------------------------------------
+# 期間（とりあえず2年分）
+end = datetime.now()
+start = end - timedelta(days=365 * 2)
+
+# 分析する銘柄
+market = '^GSPC'   # S&P500
+target = 'NVDA'    # 中心にみる銘柄
+others = ['AMD', 'AVGO', 'MSFT', 'GOOGL', 'AMZN', 'META', 'TSLA', 'SMCI', '^SOX']
+
 def load_returns(start, end):
-    """
-    YahooFinance から調整後終値を取得し、対数リターンを返す。
-    """
-    tickers = ['NVDA', 'SPY', 'SMCI', 'AMD', 'MSFT', 'XLV', 'XLU']
+    # まとめて取れるやつは全部取る
+    tickers = [market, target] + others
+    data = yf.download(tickers, start=start, end=end)
+    
+    # yfinance新バージョンではauto_adjust=Trueがデフォルト
+    # Closeが調整後終値になっている
+    if isinstance(data.columns, pd.MultiIndex):
+        data = data['Close']
+    else:
+        data = data[['Close']]
+    
+    data = data.dropna()
 
-    print(f"株価データ取得: {start} → {end}")
-    prices = yf.download(tickers, start=start, end=end)['Adj Close']
+    # 対数リターン
+    ret = np.log(data / data.shift(1))
+    return ret.dropna()
 
-    # 欠損があれば前日の値で補完
-    prices = prices.fillna(method='ffill').dropna()
+def orthogonalize_nvda(ret):
+    # Step1: NVDA の市場要因を落とす
+    y = ret[target]
+    X = sm.add_constant(ret[market])
+    model = sm.OLS(y, X).fit()
+    nvda_res = model.resid
+    nvda_res.name = "nvda_res"
+    return nvda_res, model
 
-    # 対数収益率
-    returns = np.log(prices / prices.shift(1)).dropna()
-    return returns
-
-
-# ---------------------------------------------------------
-# 2. Nvidia 固有ショックと各銘柄の反応 β 推定
-# ---------------------------------------------------------
-def run_two_stage_regression(returns):
-    """
-    まず NVDA の市場影響（SPY）を取り除き残差を"NVDA の固有ショック"とみなし、
-    次に他銘柄がそのショックにどれだけ反応するかを推計する。
-    """
-    # --- Step1: NVDA の市場ベータ調整 ---
-    X = sm.add_constant(returns['SPY'])
-    y = returns['NVDA']
-
-    step1 = sm.OLS(y, X).fit()
-
-    nvda_resid = step1.resid
-    nvda_resid.name = "NVDA_Shock"
-
-    print("\n[Step1] NVDA の市場ベータを推定")
-    print(f"  NVDA β to SPY: {step1.params['SPY']:.4f}")
-
-    # --- Step2: 各銘柄の NVDA ショック感応度 ---
-    factors = pd.concat([returns['SPY'], nvda_resid], axis=1)
-    X2 = sm.add_constant(factors)
-
+def sensitivity_analysis(ret, nvda_res):
     results = []
-    targets = [c for c in returns.columns if c not in ['NVDA', 'SPY']]
 
-    for tkr in targets:
-        model = sm.OLS(returns[tkr], X2).fit()
+    # 市場とNVDA残差を並べる
+    X = pd.concat([ret[market], nvda_res], axis=1)
+    X = sm.add_constant(X)
+
+    for t in others:
+        if t not in ret.columns:
+            continue
+
+        y = ret[t]
+        m = sm.OLS(y, X).fit()
+
         results.append({
-            "Ticker": tkr,
-            "Market_Beta": model.params['SPY'],
-            "NVDA_Sensitivity": model.params['NVDA_Shock'],
-            "R2": model.rsquared
+            "Ticker": t,
+            "Market_Beta": m.params[market],
+            "NVDA_Sensitivity": m.params["nvda_res"],
+            "P_Value": m.pvalues["nvda_res"],
+            "R2": m.rsquared
         })
 
-    df = pd.DataFrame(results).set_index("Ticker")
-    return df, nvda_resid
+    return pd.DataFrame(results)
 
-
-# ---------------------------------------------------------
-# 3. Nvidia 下落時の市場インパクトの簡易試算
-# ---------------------------------------------------------
-def simulate_market_effect(result_df, nvda_move=-0.10, nvda_weight=0.07):
-    """
-    Nvidia が一定割合下落したときの S&P500 への影響を簡易的に推計する。
-    """
-    print(f"\n[Simulation] Nvidia が {nvda_move*100:.1f}% 下落した場合の想定")
-
-    # SP500 へ直接入る影響
-    direct = nvda_weight * nvda_move
-
-    # 他銘柄が NVDA ショックに反応する分
-    avg_beta = result_df['NVDA_Sensitivity'].mean()
-    spillover = (1 - nvda_weight) * avg_beta * nvda_move * 1.5  # 仮に流動性係数1.5
-
-    total = direct + spillover
-
-    print(f"  直接影響 : {direct*100:.2f}%")
-    print(f"  波及影響 : {spillover*100:.2f}%")
-    print(f"  合計     : {total*100:.2f}%")
-    if direct != 0:
-        print(f"  マルチプライヤー: {total/direct:.2f} 倍")
-
-
-# ---------------------------------------------------------
-# メイン処理
-# ---------------------------------------------------------
-if __name__ == "__main__":
-
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
-
-    # データ読み込み
-    ret = load_returns(start, end)
-
-    # 回帰分析
-    sensitivity, nvda_shock = run_two_stage_regression(ret)
-
-    print("\n[Step2] 各銘柄の NVDA ショック感応度")
-    print("-" * 50)
-    print(sensitivity[['NVDA_Sensitivity', 'Market_Beta']].sort_values('NVDA_Sensitivity', ascending=False))
-    print("-" * 50)
-
-    # シミュレーション
-    simulate_market_effect(sensitivity)
-
-    # --- グラフ ---
-    plt.figure(figsize=(10, 6))
-    sns.barplot(
-        x=sensitivity.index,
-        y="NVDA_Sensitivity",
-        data=sensitivity,
-        palette="viridis"
-    )
-    plt.axhline(0, color='black')
-    plt.title("Sensitivity to Nvidia Idiosyncratic Shock")
-    plt.ylabel("Sensitivity")
-    plt.grid(axis='y', linestyle='--', alpha=0.6)
+def plot_sensitivity(df):
+    plt.figure(figsize=(10, 5))
+    sns.barplot(x="Ticker", y="NVDA_Sensitivity", data=df, hue="Ticker", palette="viridis", legend=False)
+    plt.axhline(0, color="black", linewidth=1)
+    plt.title("Sensitivity to NVDA Idiosyncratic Shock")
     plt.tight_layout()
     plt.show()
+
+def main():
+    ret = load_returns(start, end)
+    nvda_res, step1 = orthogonalize_nvda(ret)
+
+    print("NVDAの市場ベータ:", round(step1.params[market], 4))
+
+    df = sensitivity_analysis(ret, nvda_res)
+    print(df[["Ticker", "NVDA_Sensitivity", "P_Value"]])
+
+    # NVDAが10%動いた場合のざっくり計算
+    shock = 0.10
+    df["Impact_10pct"] = df["NVDA_Sensitivity"] * shock * 100
+    print("\nNVDAが10%動いた時の推定インパクト（%）:")
+    print(df[["Ticker", "Impact_10pct"]].round(2))
+
+    plot_sensitivity(df)
+
+if __name__ == "__main__":
+    main()
+
